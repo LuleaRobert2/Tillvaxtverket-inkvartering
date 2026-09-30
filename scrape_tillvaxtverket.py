@@ -57,76 +57,127 @@ REVISION_COLUMNS = [
 KEY_COLUMNS = ["ArManad", "Kommun", "Hemland"]
 
 
-def api_params(offset: int) -> list[tuple[str, str]]:
-    # Grouping deliberately omits ANLAGGNINGSTYP_NAMN. Diver therefore
-    # summarizes ANTAL_GASTNATTER across all facility types, corresponding
-    # to "Alla värden" for facility type in the portal.
-    return [
-        ("filter:KOMMUN_NAMN", MUNICIPALITY),
-        ("filter:NIVA_NAMN", LEVEL_NAME),
-        ("filter:AR:gte", str(START_YEAR)),
-        ("dimension", "AR"),
-        ("dimension", "MANAD_NAMN_LANG"),
-        ("dimension", "LAND_NAMN"),
-        ("column", "ANTAL_GASTNATTER"),
-        ("sort", "AR"),
-        ("sort", "MANAD_NAMN_LANG"),
-        ("sort", "LAND_NAMN"),
-        ("limit", str(PAGE_SIZE)),
-        ("offset", str(offset)),
-        ("format", "json"),
-        ("formatted", "false"),
-    ]
+RAW_COLUMNS = [
+    "KOMMUN_NAMN",
+    "NIVA_NAMN",
+    "AR",
+    "MANAD_NAMN_LANG",
+    "LAND_NAMN",
+    "ANLAGGNINGSTYP_NAMN",
+    "ANTAL_GASTNATTER",
+]
 
 
-def fetch_page(session: requests.Session, offset: int) -> dict:
+def api_params(offset: int, mode: str) -> list[tuple[str, str]]:
+    """
+    Use an ungrouped query and aggregate locally.
+
+    Tillvaxtverket's cBase currently returns HTTP 500 for the original
+    grouped query. Region Uppsala's public implementation uses ungrouped
+    column queries against the same cBase, so that is the primary approach
+    here. We first ask the server to filter Lulea. If that filter is not
+    accepted by the service, we fall back to an unfiltered paginated query
+    and filter locally.
+    """
+    params: list[tuple[str, str]] = []
+
+    if mode == "municipality":
+        params.append(("filter:KOMMUN_NAMN", MUNICIPALITY))
+    elif mode != "all":
+        raise ValueError(f"Okant API-lage: {mode}")
+
+    for column in RAW_COLUMNS:
+        params.append(("column", column))
+
+    params.extend(
+        [
+            ("limit", str(PAGE_SIZE)),
+            ("offset", str(offset)),
+            ("format", "json"),
+            ("formatted", "false"),
+        ]
+    )
+    return params
+
+
+def fetch_page(session: requests.Session, offset: int, mode: str) -> dict:
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
+        response = None
         try:
             response = session.get(
                 API_URL,
-                params=api_params(offset),
+                params=api_params(offset, mode),
                 timeout=REQUEST_TIMEOUT,
                 headers={"User-Agent": "LuleaRobert2/Tillvaxtverket-inkvartering"},
             )
-            response.raise_for_status()
+            if not response.ok:
+                body = response.text[:1200].replace("\n", " ")
+                raise RuntimeError(
+                    f"HTTP {response.status_code} fran API:t. Svar: {body or '<tomt svar>'}"
+                )
             payload = response.json()
             if not isinstance(payload, dict) or "rows" not in payload:
-                raise RuntimeError("API-svaret saknar fältet 'rows'.")
+                raise RuntimeError("API-svaret saknar faltet 'rows'.")
             return payload
         except (requests.RequestException, ValueError, RuntimeError) as exc:
             last_error = exc
             if attempt == MAX_RETRIES:
                 break
             wait = 2 ** (attempt - 1)
-            print(f"API-försök {attempt} misslyckades: {exc}. Nytt försök om {wait}s.")
+            print(
+                f"API-forsok {attempt} misslyckades i lage {mode}: {exc}. "
+                f"Nytt forsok om {wait}s."
+            )
             time.sleep(wait)
-    raise RuntimeError(f"Tillväxtverkets API kunde inte hämtas: {last_error}")
+    raise RuntimeError(f"Tillvaxtverkets API kunde inte hamtas i lage {mode}: {last_error}")
 
 
-def fetch_all_rows() -> list[dict]:
+def fetch_rows_for_mode(mode: str) -> list[dict]:
     session = requests.Session()
     all_rows: list[dict] = []
     offset = 0
 
     while True:
-        payload = fetch_page(session, offset)
+        payload = fetch_page(session, offset, mode)
         rows = payload.get("rows") or []
         if not isinstance(rows, list):
-            raise RuntimeError("API-fältet 'rows' hade oväntat format.")
+            raise RuntimeError("API-faltet 'rows' hade ovantat format.")
 
         all_rows.extend(rows)
-        print(f"Hämtat {len(rows):,} rader (totalt {len(all_rows):,}).")
+        print(
+            f"Hamtat {len(rows):,} rader i lage {mode} "
+            f"(totalt {len(all_rows):,})."
+        )
 
         if len(rows) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
 
     if not all_rows:
-        raise RuntimeError(
-            f"API:t returnerade inga rader för {MUNICIPALITY}, nivå {LEVEL_NAME}, från {START_YEAR}."
-        )
+        raise RuntimeError(f"API:t returnerade inga rader i lage {mode}.")
     return all_rows
+
+
+def fetch_all_rows() -> list[dict]:
+    errors: list[str] = []
+
+    # Preferred: raw rows, but server-side filtered to Lulea.
+    # Fallback: exact query pattern known to be used by Region Uppsala:
+    # selected columns + pagination, with filtering performed locally.
+    for mode in ("municipality", "all"):
+        try:
+            print(f"Provar API-lage: {mode}")
+            return fetch_rows_for_mode(mode)
+        except RuntimeError as exc:
+            errors.append(f"{mode}: {exc}")
+            if mode == "municipality":
+                print(
+                    "Kommunfiltret misslyckades. Provar ofiltrerat API-uttag "
+                    "och filtrerar Lulea lokalt."
+                )
+
+    raise RuntimeError("Alla API-strategier misslyckades. " + " | ".join(errors))
 
 
 def parse_month(value: object) -> int:
@@ -146,41 +197,100 @@ def parse_month(value: object) -> int:
 
 def normalize(rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
-    required = {"AR", "MANAD_NAMN_LANG", "LAND_NAMN", "ANTAL_GASTNATTER"}
+    required = {
+        "KOMMUN_NAMN",
+        "AR",
+        "MANAD_NAMN_LANG",
+        "LAND_NAMN",
+        "ANTAL_GASTNATTER",
+    }
     missing = required - set(df.columns)
     if missing:
         raise RuntimeError(f"API-svaret saknar kolumner: {sorted(missing)}")
 
+    # Always filter locally as well. This makes the output independent of
+    # whether the server-side municipality filter was used.
+    municipality = df["KOMMUN_NAMN"].astype("string").str.strip()
+    df = df.loc[municipality.eq(MUNICIPALITY)].copy()
+    if df.empty:
+        sample = sorted(
+            pd.Series(rows, dtype="object").astype(str).head(5).tolist()
+        )
+        raise RuntimeError(
+            f"Inga API-rader matchade KOMMUN_NAMN={MUNICIPALITY!r}. "
+            f"Kontrollera kommunnamnet i kallan."
+        )
+
+    if "NIVA_NAMN" in df.columns:
+        levels = df["NIVA_NAMN"].astype("string").str.strip()
+        exact = levels.str.casefold().eq(LEVEL_NAME.casefold())
+        if exact.any():
+            df = df.loc[exact].copy()
+        else:
+            available = sorted(x for x in levels.dropna().unique().tolist() if x)
+            # Some source versions may use e.g. "Kommuner". Accept a unique
+            # level beginning with "kommun", otherwise stop rather than mix levels.
+            kommun_levels = [x for x in available if str(x).casefold().startswith("kommun")]
+            if len(kommun_levels) == 1:
+                chosen = kommun_levels[0]
+                print(
+                    f"Obs: nivan {LEVEL_NAME!r} fanns inte; anvander "
+                    f"kallans niva {chosen!r}."
+                )
+                df = df.loc[levels.eq(chosen)].copy()
+            elif available:
+                raise RuntimeError(
+                    f"Kunde inte entydigt valja kommunniva. NIVA_NAMN for "
+                    f"{MUNICIPALITY}: {available}"
+                )
+
+    df["AR"] = pd.to_numeric(df["AR"], errors="coerce")
+    df = df.loc[df["AR"].notna() & (df["AR"] >= START_YEAR)].copy()
+    if df.empty:
+        raise RuntimeError(
+            f"Inga rader aterstod for {MUNICIPALITY} fran {START_YEAR}."
+        )
+
     out = pd.DataFrame()
-    out["Ar"] = pd.to_numeric(df["AR"], errors="raise").astype(int)
+    out["Ar"] = df["AR"].astype(int)
     out["Manad"] = df["MANAD_NAMN_LANG"].map(parse_month).astype(int)
     out["ArManad"] = out["Ar"] * 100 + out["Manad"]
     out["Kommun"] = MUNICIPALITY
     out["Hemland"] = df["LAND_NAMN"].astype("string").str.strip()
     out["Hemland"] = out["Hemland"].fillna("Ej angivet").replace("", "Ej angivet")
-    out["Gastnatter"] = pd.to_numeric(df["ANTAL_GASTNATTER"], errors="coerce").round().astype("Int64")
+    out["Gastnatter"] = (
+        pd.to_numeric(df["ANTAL_GASTNATTER"], errors="coerce")
+        .round()
+        .astype("Int64")
+    )
 
-    # The API query is already grouped on year/month/country, but sum again as
-    # a defensive measure in case the service returns duplicate group rows.
+    # "Alla varden" for accommodation type in the portal means all underlying
+    # accommodation types are selected. Since the API rows are ungrouped,
+    # aggregate them here to one value per year/month/country.
     out = (
-        out.groupby(["Ar", "Manad", "ArManad", "Kommun", "Hemland"], as_index=False, dropna=False)[
-            "Gastnatter"
-        ]
+        out.groupby(
+            ["Ar", "Manad", "ArManad", "Kommun", "Hemland"],
+            as_index=False,
+            dropna=False,
+        )["Gastnatter"]
         .sum(min_count=1)
         .sort_values(["ArManad", "Hemland"], kind="stable")
         .reset_index(drop=True)
     )
 
     if out.empty:
-        raise RuntimeError("Ingen användbar data återstod efter normalisering.")
+        raise RuntimeError("Ingen anvandbar data aterstod efter normalisering.")
     if out.duplicated(KEY_COLUMNS).any():
-        raise RuntimeError("Dubbletter finns kvar efter aggregering; avbryter för att skydda history.csv.")
+        raise RuntimeError(
+            "Dubbletter finns kvar efter aggregering; avbryter for att skydda history.csv."
+        )
 
     min_year = int(out["Ar"].min())
     if REQUIRE_START_YEAR and min_year > START_YEAR:
         raise RuntimeError(
-            f"API:t börjar först {min_year} för {MUNICIPALITY}; begärd historik börjar {START_YEAR}. "
-            "history.csv skrivs därför inte så att en ofullständig serie inte ser komplett ut."
+            f"API:t borjar forst {min_year} for {MUNICIPALITY}; begard historik "
+            f"borjar {START_YEAR}. history.csv skrivs inte sa att en ofullstandig "
+            "serie inte ser komplett ut."
         )
 
     return out[HISTORY_COLUMNS]
